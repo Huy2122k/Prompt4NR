@@ -1,4 +1,3 @@
-
 import os
 import argparse
 import pickle
@@ -8,12 +7,17 @@ import shutil
 import warnings
 warnings.filterwarnings('ignore')
 
+import random
+import numpy as np
+
 from tqdm import tqdm
 from datetime import datetime
+import torch
 import torch.cuda
 from torch.utils.data import DataLoader
 
-from transformers import BertTokenizer
+# Sử dụng fast tokenizer để tăng tốc
+from transformers import BertTokenizerFast  
 from transformers import AdamW
 
 import torch.distributed as dist
@@ -58,35 +62,26 @@ class Logger(object):
 
 
 def load_tokenizer(model_name, args):
-    tokenizer = BertTokenizer.from_pretrained(model_name)
-    conti_tokens1 = []
-    for i in range(args.num_conti1):
-        conti_tokens1.append('[P' + str(i + 1) + ']')
-    conti_tokens2 = []
-    for i in range(args.num_conti2):
-        conti_tokens2.append('[Q' + str(i + 1) + ']')
+    tokenizer = BertTokenizerFast.from_pretrained(model_name)
+    conti_tokens1 = ['[P' + str(i + 1) + ']' for i in range(args.num_conti1)]
+    conti_tokens2 = ['[Q' + str(i + 1) + ']' for i in range(args.num_conti2)]
 
     new_tokens = ['[NSEP]']
     tokenizer.add_tokens(new_tokens)
+    tokenizer.add_tokens(conti_tokens1 + conti_tokens2)
 
-    conti_tokens = conti_tokens1 + conti_tokens2
-    tokenizer.add_tokens(conti_tokens)
-
-    new_vocab_size = len(tokenizer)
-    args.vocab_size = new_vocab_size
-
+    args.vocab_size = len(tokenizer)
     return tokenizer, conti_tokens1, conti_tokens2
 
 
 def load_model(model_name, tokenizer, args):
     answer = ['no', 'yes']
     answer_ids = tokenizer.encode(answer, add_special_tokens=False)
-
     net = BERTPrompt4NR(model_name, answer_ids, args)
     return net
 
 
-def train(model, optimizer, data_loader, rank, world_size, epoch, sampler):
+def train(model, optimizer, data_loader, rank, world_size, epoch, sampler, scaler):
     model.train()
     mean_loss = torch.zeros(2).to(rank)
     acc_cnt = torch.zeros(2).to(rank)
@@ -96,16 +91,17 @@ def train(model, optimizer, data_loader, rank, world_size, epoch, sampler):
         sampler.set_epoch(epoch)
     for step, data in enumerate(data_loader):
         batch_enc, batch_attn, batch_labs, batch_imp = data
-
         batch_enc = batch_enc.to(rank)
         batch_attn = batch_attn.to(rank)
         batch_labs = batch_labs.to(rank)
 
-        loss, scores = model(batch_enc, batch_attn, batch_labs)
-
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # Áp dụng mixed precision
+        with torch.cuda.amp.autocast():
+            loss, scores = model(batch_enc, batch_attn, batch_labs)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         mean_loss[0] += loss.item()
         mean_loss[1] += 1
@@ -143,14 +139,15 @@ def eval(model, rank, world_size, data_loader):
     labels = []
     for step, data in enumerate(data_loader):
         batch_enc, batch_attn, batch_labs, batch_imp = data
-        imp_ids = imp_ids + batch_imp
-        labels = labels + batch_labs.cpu().numpy().tolist()
+        imp_ids += batch_imp
+        labels += batch_labs.cpu().numpy().tolist()
 
         batch_enc = batch_enc.to(rank)
         batch_attn = batch_attn.to(rank)
         batch_labs = batch_labs.to(rank)
 
-        loss, scores = model(batch_enc, batch_attn, batch_labs)
+        with torch.cuda.amp.autocast():
+            loss, scores = model(batch_enc, batch_attn, batch_labs)
 
         ranking_scores = scores[:, 1].detach()
         val_scores.append(ranking_scores)
@@ -192,6 +189,10 @@ def fsdp_main(rank, world_size, args):
     args.world_size = world_size
     args.gpu = rank
     init_seed(rank + 1)
+
+    # Kích hoạt cuDNN benchmark để tối ưu hóa hiệu năng khi kích thước input không thay đổi
+    torch.backends.cudnn.benchmark = True
+
     if rank == 0:
         if args.log:
             sys.stdout = Logger(args.log_file, sys.stdout)
@@ -203,14 +204,14 @@ def fsdp_main(rank, world_size, args):
     if rank == 0:
         print(args)
 
-    # load tokenizer
+    # Load tokenizer (sử dụng BertTokenizerFast)
     tokenizer, conti_tokens1, conti_tokens2 = load_tokenizer(args.model_name, args)
     conti_tokens = [conti_tokens1, conti_tokens2]
 
-    # load model
+    # Load mô hình
     net = load_model(args.model_name, tokenizer, args)
 
-    # load data
+    # Load dữ liệu
     news_dict = pickle.load(open(os.path.join(args.data_path, 'news.txt'), 'rb'))
     train_dataset = MyDataset(args, tokenizer, news_dict, conti_tokens, status='train')
     val_dataset = MyDataset(args, tokenizer, news_dict, conti_tokens, status='val')
@@ -222,19 +223,19 @@ def fsdp_main(rank, world_size, args):
         print(val_dataset[3]['sentence'])
 
     train_sampler = DistributedSampler(train_dataset,
-                                       rank=rank,
-                                       num_replicas=world_size,
-                                       shuffle=True)
+                                         rank=rank,
+                                         num_replicas=world_size,
+                                         shuffle=True)
     val_sampler = DistributedSampler(val_dataset,
-                                     rank=rank,
-                                     num_replicas=world_size)
+                                       rank=rank,
+                                       num_replicas=world_size)
 
     train_kwargs = {'batch_size': args.batch_size, 'sampler': train_sampler,
                     'shuffle': False, 'pin_memory': True, 'collate_fn': train_dataset.collate_fn}
     val_kwargs = {'batch_size': args.test_batch_size, 'sampler': val_sampler,
                   'shuffle': False, 'pin_memory': True, 'collate_fn': val_dataset.collate_fn}
 
-    nw = 8
+    nw = 8  # Số lượng worker, bạn có thể điều chỉnh cho phù hợp
     cuda_kwargs = {'num_workers': nw, 'pin_memory': True}
     train_kwargs.update(cuda_kwargs)
     val_kwargs.update(cuda_kwargs)
@@ -245,7 +246,7 @@ def fsdp_main(rank, world_size, args):
     net = net.to(rank)
     net = DDP(net, device_ids=[rank])
 
-    # AdamW
+    # Khởi tạo optimizer (AdamW)
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in net.named_parameters() if not any(nd in n for nd in no_decay)],
@@ -255,15 +256,14 @@ def fsdp_main(rank, world_size, args):
     optimizer = AdamW(params=optimizer_grouped_parameters, lr=args.lr)
     # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3], gamma=0.1)
 
+    # Khởi tạo GradScaler cho mixed precision
+    scaler = torch.cuda.amp.GradScaler()
+
     metrics = ['auc', 'mrr', 'ndcg5', 'ndcg10']
-    best_val_result = {}
-    best_val_epoch = {}
-    for m in metrics:
-        best_val_result[m] = 0.0
-        best_val_epoch[m] = 0
+    best_val_result = {m: 0.0 for m in metrics}
+    best_val_epoch = {m: 0 for m in metrics}
 
     for epoch in range(args.epochs):
-        # #################################  train  ###################################
         st_tra = time.time()
         if rank == 0:
             print('--------------------------------------------------------------------')
@@ -271,8 +271,9 @@ def fsdp_main(rank, world_size, args):
             print('Epoch: ', epoch)
             print('lr:', optimizer.state_dict()['param_groups'][0]['lr'])
 
-        loss, acc_tra, acc_pos_tra, pos_ratio_tra = \
-            train(net, optimizer, train_loader, rank, world_size, epoch, train_sampler)
+        loss, acc_tra, acc_pos_tra, pos_ratio_tra = train(
+            net, optimizer, train_loader, rank, world_size, epoch, train_sampler, scaler
+        )
         # scheduler.step()
 
         end_tra = time.time()
@@ -286,11 +287,9 @@ def fsdp_main(rank, world_size, args):
                 print('save file', file)
                 torch.save(net.module.state_dict(), file)
 
-        # #################################  val  ###################################
         st_val = time.time()
-        val_scores, acc_val, acc_pos_val, pos_ratio_val, val_impids, val_labels = \
-            eval(net, rank, world_size, val_loader)
-        impressions = {}    # {1: {'score': [], 'lab': []}}
+        val_scores, acc_val, acc_pos_val, pos_ratio_val, val_impids, val_labels = eval(net, rank, world_size, val_loader)
+        impressions = {}
         for i in range(world_size):
             scores, imp_id, labs = val_scores[i], val_impids[i], val_labels[i]
             assert scores.size() == imp_id.size() == labs.size()
@@ -301,19 +300,16 @@ def fsdp_main(rank, world_size, args):
                 sco, imp, lab = scores[j], imp_id[j], labs[j]
                 if imp not in impressions:
                     impressions[imp] = {'score': [], 'lab': []}
-                    impressions[imp]['score'].append(sco)
-                    impressions[imp]['lab'].append(lab)
-                else:
-                    impressions[imp]['score'].append(sco)
-                    impressions[imp]['lab'].append(lab)
+                impressions[imp]['score'].append(sco)
+                impressions[imp]['lab'].append(lab)
 
         predicts, truths = [], []
         for imp in impressions:
             sims, labs = impressions[imp]['score'], impressions[imp]['lab']
             sl_zip = sorted(zip(sims, labs), key=lambda x: x[0], reverse=True)
             sort_sims, sort_labs = zip(*sl_zip)
-            predicts.append(list(range(1, len(sort_labs) + 1, 1)))
-            truths.append(sort_labs)
+            predicts.append(list(range(1, len(sort_labs) + 1)))
+            truths.append(list(sort_labs))
 
         auc_val, mrr_val, ndcg5_val, ndcg10_val = evaluate(predicts, truths)
         if auc_val > best_val_result['auc']:
@@ -334,9 +330,9 @@ def fsdp_main(rank, world_size, args):
         if rank == 0:
             print("Validate: AUC: %0.4f\tMRR: %0.4f\tnDCG@5: %0.4f\tnDCG@10: %0.4f\t[Val-Time: %0.2f]" %
                   (auc_val, mrr_val, ndcg5_val, ndcg10_val, val_spend))
-            print('Best Result: AUC: %0.4f \tMRR: %0.4f \tNDCG@5: %0.4f \t NDCG@10: %0.4f' %
+            print('Best Result: AUC: %0.4f \tMRR: %0.4f \tNDCG@5: %0.4f \tNDCG@10: %0.4f' %
                   (best_val_result['auc'], best_val_result['mrr'], best_val_result['ndcg5'], best_val_result['ndcg10']))
-            print('Best Epoch: AUC: %d \tMRR: %d \tNDCG@5: %d \t NDCG@10: %d' %
+            print('Best Epoch: AUC: %d \tMRR: %d \tNDCG@5: %d \tNDCG@10: %d' %
                   (best_val_epoch['auc'], best_val_epoch['mrr'], best_val_epoch['ndcg5'], best_val_epoch['ndcg10']))
         dist.barrier()
     if rank == 0:
@@ -344,10 +340,9 @@ def fsdp_main(rank, world_size, args):
         best_epoch = max(set(best_epochs), key=best_epochs.count)
         if args.model_save:
             old_file = args.save_dir + '/Epoch-' + str(best_epoch) + '.pt'
-            # old_file = args.save_dir + '/Epoch-2.pt'
             if not os.path.exists('./temp'):
                 os.makedirs('./temp')
-            copy_file = './temp' + '/BestModel.pt'
+            copy_file = './temp/BestModel.pt'
             shutil.copy(old_file, copy_file)
             print('Copy ' + old_file + ' >>> ' + copy_file)
     cleanup()
@@ -361,28 +356,25 @@ if __name__ == '__main__':
     parser.add_argument('--train_data_path', default='../DATA/MIND-Small-0.5', type=str, help='Path')
 
     parser.add_argument('--epochs', default=5, type=int, help='training epochs')
-    parser.add_argument('--batch_size', default=24, type=int, help='batch_size')
-    parser.add_argument('--test_batch_size', default=200, type=int, help='test batch_size')
+    parser.add_argument('--batch_size', default=24, type=int, help='batch size')
+    parser.add_argument('--test_batch_size', default=200, type=int, help='test batch size')
     parser.add_argument('--lr', default=2e-5, type=float, help='learning rate')
     parser.add_argument('--wd', default=1e-3, type=float, help='weight decay')
 
     parser.add_argument('--max_his', default=50, type=int, help='max number of history')
     parser.add_argument('--max_tokens', default=500, type=int, help='max number of tokens')
-    parser.add_argument('--num_negs', default=4, type=int, help='number of negtives')
+    parser.add_argument('--num_negs', default=4, type=int, help='number of negatives')
 
-    parser.add_argument('--max_his_len', default=450, type=int, help='max number of history')
+    parser.add_argument('--max_his_len', default=450, type=int, help='max history length')
 
-    parser.add_argument('--num_conti1', default=3, type=int, help='number of continuous tokens')
-    parser.add_argument('--num_conti2', default=3, type=int, help='number of continuous tokens')
+    parser.add_argument('--num_conti1', default=3, type=int, help='number of continuous tokens type1')
+    parser.add_argument('--num_conti2', default=3, type=int, help='number of continuous tokens type2')
 
     parser.add_argument('--device', default='cuda', help='device id')
     parser.add_argument('--world_size', default=2, type=int, help='number of distributed processes')
 
     parser.add_argument('--model_save', default=True, type=bool, help='save model file')
     parser.add_argument('--log', default=True, type=bool, help='whether write log file')
-
-    # parser.add_argument('--model_save', default=False, type=bool, help='save model file')
-    # parser.add_argument('--log', default=False, type=bool, help='whether write log file')
 
     args = parser.parse_args()
 
@@ -392,7 +384,7 @@ if __name__ == '__main__':
             os.makedirs(save_dir)
         args.save_dir = save_dir
 
-    # Create log file
+    # Tạo file log tùy thuộc vào data_path và các thông số
     if args.train_data_path == '':
         args.train_data_path = args.data_path
         if args.data_path == '../DATA/MIND-Demo':
@@ -447,11 +439,3 @@ if __name__ == '__main__':
     t1 = time.time()
     run_time = (t1 - t0) / 3600
     print('Running time: %0.4f' % run_time)
-
-
-
-
-
-
-
-
